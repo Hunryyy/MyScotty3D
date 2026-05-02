@@ -142,6 +142,9 @@ void Pipeline<primitive_type, Program, flags>::run(std::vector<Vertex> const& ve
 			// "Less" means the depth test passes when the new fragment has depth less than the stored depth.
 			// A1T4: Depth_Less
 			// TODO: implement depth test! We want to only emit fragments that have a depth less than the stored depth, hence "Depth_Less".
+			if (!(f.fb_position.z < fb_depth)) {
+            continue;
+        	}
 		} else {
 			static_assert((flags & PipelineMask_Depth) <= Pipeline_Depth_Always, "Unknown depth test flag.");
 		}
@@ -164,12 +167,12 @@ void Pipeline<primitive_type, Program, flags>::run(std::vector<Vertex> const& ve
 			} else if constexpr ((flags & PipelineMask_Blend) == Pipeline_Blend_Add) {
 				// A1T4: Blend_Add
 				// TODO: framebuffer color should have fragment color multiplied by fragment opacity added to it.
-				fb_color = sf.color; //<-- replace this line
+				fb_color = fb_color + sf.color * sf.opacity;
 			} else if constexpr ((flags & PipelineMask_Blend) == Pipeline_Blend_Over) {
 				// A1T4: Blend_Over
 				// TODO: set framebuffer color to the result of "over" blending (also called "alpha blending") the fragment color over the framebuffer color, using the fragment's opacity
 				// 		 You may assume that the framebuffer color has its alpha premultiplied already, and you just want to compute the resulting composite color
-				fb_color = sf.color; //<-- replace this line
+				fb_color = sf.color + (1.0f - sf.opacity) * fb_color;
 			} else {
 				static_assert((flags & PipelineMask_Blend) <= Pipeline_Blend_Over, "Unknown blending flag.");
 			}
@@ -353,23 +356,80 @@ void Pipeline<p, P, flags>::rasterize_line(
 	ClippedVertex const& va, ClippedVertex const& vb,
 	std::function<void(Fragment const&)> const& emit_fragment) {
 	if constexpr ((flags & PipelineMask_Interp) != Pipeline_Interp_Flat) {
-		assert(0 && "rasterize_line should only be invoked in flat interpolation mode.");
-	}
-	// A1T2: rasterize_line
+        assert(0 && "rasterize_line should only be invoked in flat interpolation mode.");
+    }
 
-	// TODO: Check out the block comment above this function for more information on how to fill in
-	// this function!
-	// The OpenGL specification section 3.5 may also come in handy.
+    // 1. 基础坐标与微偏移
+    Vec2 p0 = va.fb_position.xy();
+    Vec2 p1 = vb.fb_position.xy();
+    const float e = 1e-5f;
+    p0 += Vec2(e, e * e);
+    p1 += Vec2(e, e * e);
 
-	{ // As a placeholder, draw a point in the middle of the line:
-		//(remove this code once you have a real implementation)
-		Fragment mid;
-		mid.fb_position = (va.fb_position + vb.fb_position) / 2.0f;
-		mid.attributes = va.attributes;
-		mid.derivatives.fill(Vec2(0.0f, 0.0f));
-		emit_fragment(mid);
-	}
+    int ix = (int)std::floor(p0.x);
+    int iy = (int)std::floor(p0.y);
+    int i1x = (int)std::floor(p1.x);
+    int i1y = (int)std::floor(p1.y);
 
+    auto emit = [&](int x, int y) {
+        Fragment frag;
+        frag.fb_position.x = (float)x + 0.5f;
+        frag.fb_position.y = (float)y + 0.5f;
+        
+        // 计算投影深度 z
+        Vec2 dir = p1 - p0;
+        float len_sq = dir.norm_squared();
+        float t = 0.0f;
+        if (len_sq > 1e-7f) {
+            t = dot(Vec2(frag.fb_position.x, frag.fb_position.y) - p0, dir) / len_sq;
+        }
+        t = std::clamp(t, 0.0f, 1.0f);
+        frag.fb_position.z = (1.0f - t) * va.fb_position.z + t * vb.fb_position.z;
+
+        frag.attributes = va.attributes; 
+        frag.derivatives.fill(Vec2(0.0f, 0.0f));
+        emit_fragment(frag);
+    };
+
+    // 2. DDA 步进逻辑：处理跨越像素边界的情况
+    if (ix != i1x || iy != i1y) {
+        float dx = p1.x - p0.x;
+        float dy = p1.y - p0.y;
+        int stepX = (dx > 0) ? 1 : -1;
+        int stepY = (dy > 0) ? 1 : -1;
+
+        float tMaxX = (std::abs(dx) > 1e-7f) ? ((std::floor(p0.x) + (dx > 0 ? 1.0f : 0.0f)) - p0.x) / dx : std::numeric_limits<float>::max();
+        float tMaxY = (std::abs(dy) > 1e-7f) ? ((std::floor(p0.y) + (dy > 0 ? 1.0f : 0.0f)) - p0.y) / dy : std::numeric_limits<float>::max();
+        float tDeltaX = (std::abs(dx) > 1e-7f) ? std::abs(1.0f / dx) : std::numeric_limits<float>::max();
+        float tDeltaY = (std::abs(dy) > 1e-7f) ? std::abs(1.0f / dy) : std::numeric_limits<float>::max();
+
+        while (ix != i1x || iy != i1y) {
+            emit(ix, iy); 
+            if (tMaxX < tMaxY) {
+                tMaxX += tDeltaX;
+                ix += stepX;
+            } else {
+                tMaxY += tDeltaY;
+                iy += stepY;
+            }
+        }
+    }
+
+    // 3. 终点像素判定：解决 diamond.outside 和长线末端[cite: 2]
+    float local_x1 = p1.x - ((float)i1x + 0.5f);
+    float local_y1 = p1.y - ((float)i1y + 0.5f);
+    bool end_outside = (std::abs(local_x1) + std::abs(local_y1) > 0.5f);
+
+    if (end_outside) {
+        float local_x0 = p0.x - ((float)i1x + 0.5f);
+        float local_y0 = p0.y - ((float)i1y + 0.5f);
+        bool start_inside = (std::abs(local_x0) + std::abs(local_y0) <= 0.5f);
+
+        // 如果是跨像素进入的，或者是同像素内从菱形内部移动到外部，则提交片段[cite: 2]
+        if (start_inside || (int)std::floor(va.fb_position.x) != i1x || (int)std::floor(va.fb_position.y) != i1y) {
+            emit(i1x, i1y);
+        }
+    }
 }
 
 /*
@@ -417,29 +477,100 @@ void Pipeline<p, P, flags>::rasterize_triangle(
 	//  same code paths. Be aware, however, that all of them need to remain working!
 	//  (e.g., if you break Flat while implementing Correct, you won't get points
 	//   for Flat.)
-	if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Flat) {
-		// A1T3: flat triangles
-		// TODO: rasterize triangle (see block comment above this function).
+	using Attributes = decltype(std::declval<Fragment>().attributes);
+	float min_x = std::floor(std::min({va.fb_position.x, vb.fb_position.x, vc.fb_position.x}));
+	float max_x = std::ceil(std::max({va.fb_position.x, vb.fb_position.x, vc.fb_position.x}));
+	float min_y = std::floor(std::min({va.fb_position.y, vb.fb_position.y, vc.fb_position.y}));
+	float max_y = std::ceil(std::max({va.fb_position.y, vb.fb_position.y, vc.fb_position.y}));
 
-		// As a placeholder, here's code that draws some lines:
-		//(remove this and replace it with a real solution)
-		Pipeline<PrimitiveType::Lines, P, flags>::rasterize_line(va, vb, emit_fragment);
-		Pipeline<PrimitiveType::Lines, P, flags>::rasterize_line(vb, vc, emit_fragment);
-		Pipeline<PrimitiveType::Lines, P, flags>::rasterize_line(vc, va, emit_fragment);
-	} else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Smooth) {
-		// A1T5: screen-space smooth triangles
-		// TODO: rasterize triangle (see block comment above this function).
+	Vec2 p0 = va.fb_position.xy();
+	Vec2 p1 = vb.fb_position.xy();
+	Vec2 p2 = vc.fb_position.xy();
 
-		// As a placeholder, here's code that calls the Flat interpolation version of the function:
-		//(remove this and replace it with a real solution)
-		Pipeline<PrimitiveType::Lines, P, (flags & ~PipelineMask_Interp) | Pipeline_Interp_Flat>::rasterize_triangle(va, vb, vc, emit_fragment);
-	} else if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Correct) {
-		// A1T5: perspective correct triangles
-		// TODO: rasterize triangle (block comment above this function).
+	auto edge_func = [](Vec2 const& a, Vec2 const& b, Vec2 const& c) {
+		return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
+	};
 
-		// As a placeholder, here's code that calls the Screen-space interpolation function:
-		//(remove this and replace it with a real solution)
-		Pipeline<PrimitiveType::Lines, P, (flags & ~PipelineMask_Interp) | Pipeline_Interp_Smooth>::rasterize_triangle(va, vb, vc, emit_fragment);
+	float area = edge_func(p0, p1, p2);
+	if (std::abs(area) < 1e-7f) return;
+
+	// Top-Left 规则准备
+	auto is_top_left = [&](Vec2 const& a, Vec2 const& b) {
+		Vec2 e = b - a;
+		if (area > 0) return (e.y == 0.0f && e.x < 0.0f) || (e.y > 0.0f);
+		else return (e.y == 0.0f && e.x > 0.0f) || (e.y < 0.0f);
+	};
+	bool tl0 = is_top_left(p0, p1), tl1 = is_top_left(p1, p2), tl2 = is_top_left(p2, p0);
+
+	// 2. 预计算插值所需的辅助属性 (针对 Correct 模式)
+	auto attrs_a = va.attributes;
+	auto attrs_b = vb.attributes;
+	auto attrs_c = vc.attributes;
+
+	if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Correct) {
+		for (size_t i = 0; i < attrs_a.size(); ++i) {
+			attrs_a[i] *= va.inv_w; // 存储 Phi/w
+			attrs_b[i] *= vb.inv_w;
+			attrs_c[i] *= vc.inv_w;
+		}
+	}
+
+	// 定义辅助函数：计算特定坐标的插值属性
+	auto get_attributes = [&](Vec2 const& px) {
+		float w2 = edge_func(p0, p1, px) / area;
+		float w0 = edge_func(p1, p2, px) / area;
+		float w1 = edge_func(p2, p0, px) / area;
+
+		Attributes res;
+		for (size_t i = 0; i < res.size(); ++i) {
+			res[i] = w0 * attrs_a[i] + w1 * attrs_b[i] + w2 * attrs_c[i];
+		}
+
+		if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Correct) {
+			float inv_w_interp = w0 * va.inv_w + w1 * vb.inv_w + w2 * vc.inv_w;
+			for (size_t i = 0; i < res.size(); ++i) {
+				res[i] /= inv_w_interp; // (Phi/w) / (1/w) = Phi
+			}
+		}
+		return res;
+	};
+
+	// 3. 遍历像素并执行发射
+	for (int y = (int)min_y; y < (int)max_y; ++y) {
+		for (int x = (int)min_x; x < (int)max_x; ++x) {
+			Vec2 px(x + 0.5f, y + 0.5f);
+			float w2 = edge_func(p0, p1, px) / area, w0 = edge_func(p1, p2, px) / area, w1 = edge_func(p2, p0, px) / area;
+
+			auto check = [](float w, bool tl) { return (w > 0.0f) || (w == 0.0f && tl); };
+			if (check(w0, tl0) && check(w1, tl1) && check(w2, tl2)) {
+				Fragment frag;
+				frag.fb_position = Vec3(px.x, px.y, w0 * va.fb_position.z + w1 * vb.fb_position.z + w2 * vc.fb_position.z);
+
+				if constexpr ((flags & PipelineMask_Interp) == Pipeline_Interp_Flat) {
+    				frag.attributes = va.attributes;
+    				frag.derivatives.fill(Vec2(0.0f, 0.0f));
+				} else {
+    
+    				frag.attributes = get_attributes(px);
+
+   
+    				auto attr_dx = get_attributes(px + Vec2(1.0f, 0.0f));
+    				auto attr_dy = get_attributes(px + Vec2(0.0f, 1.0f));
+
+					uint32_t uv_offset = FA - FD; 
+
+    for (uint32_t i = 0; i < FD; ++i) {
+        // 计算属性的变化率
+        // 确保结果被正确存入 derivatives[i]
+        float du_dx = attr_dx[uv_offset + i] - frag.attributes[uv_offset + i];
+        float du_dy = attr_dy[uv_offset + i] - frag.attributes[uv_offset + i];
+        
+        frag.derivatives[i] = Vec2(du_dx, du_dy);
+    }
+				}
+				emit_fragment(frag);
+			}
+		}
 	}
 }
 
